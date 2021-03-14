@@ -20,7 +20,9 @@ from load_blender import load_blender_data
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+random.seed(0)
 np.random.seed(0)
+torch.manual_seed(0)
 DEBUG = False
 
 
@@ -168,7 +170,6 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
 
-
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
 
@@ -206,7 +207,15 @@ def create_nerf(args):
                                                                 netchunk=args.netchunk_per_gpu*args.n_gpus)
 
     # Create optimizer
-    optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(args.momentum, 0.999))
+    print('Using momentum B_1:', args.momentum)
+    print('Using learning rate:', args.lrate, flush=True)
+
+    # optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.0, 0.999))
+    # print('Using SGD!!!!')
+    # print('Using adam without heavy ball momentum')
+    # optimizer = torch.optim.SGD(params=grad_vars, lr=args.lrate, momentum=0.9)
+    # optimizer = torch.optim.SGD(params=grad_vars, lr=args.lrate)
 
     start = 0
     basedir = args.basedir
@@ -448,11 +457,13 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
+    parser.add_argument("--momentum", type=float, default=0.9,
+                        help='B1 term for Adam')
     parser.add_argument("--chunk", type=int, default=1024*32, 
                         help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk_per_gpu", type=int, default=1024*64*4, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--no_batching", action='store_true', 
+    parser.add_argument("--no_batching", action='store_true',
                         help='only take random rays from 1 image at a time')
     parser.add_argument("--no_reload", action='store_true', 
                         help='do not reload weights from saved ckpt')
@@ -674,8 +685,10 @@ def train():
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
 
-        print('done')
+        print('done', flush=True)
         i_batch = 0
+    else:
+        print('We are taking batches of rays from one image at a time', flush=True)
 
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
@@ -683,81 +696,98 @@ def train():
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
-
-    N_iters = 200000 + 1
+    N_iters = 200000
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
+    writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
-    start = start + 1
+    start = start
     for i in trange(start, N_iters):
         time0 = time.time()
 
         # Sample random ray batch
-        if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
-
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
-
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = images[img_i]
-            pose = poses[img_i, :3,:4]
-
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
-                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-                        ), -1)
-                    if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
-                else:
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
-
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)  # (2, N_rand, 3)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-
-        #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
-
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
+        N_rand_small = 1024
+        epoch_ended = False
+        num_rays = N_rand if not use_batching else min(N_rand, rays_rgb.size(0) - i_batch)
+        total_weight = 0.0
+        for j in range(0, N_rand, N_rand_small):
+            if epoch_ended:
+                break
 
-        if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
+            if use_batching:
+                # Random over all images
+                batch = rays_rgb[i_batch:i_batch+N_rand_small] # [B, 2+1, 3*?]
+                batch = torch.transpose(batch, 0, 1)
+                batch_rays, target_s = batch[:2], batch[2]
 
-        loss.backward()
+                i_batch += N_rand_small
+                if i_batch >= rays_rgb.shape[0]:
+                    print("Shuffle data after an epoch!")
+                    rand_idx = torch.randperm(rays_rgb.shape[0])
+                    rays_rgb = rays_rgb[rand_idx]
+                    i_batch = 0
+                    epoch_ended = True
+            else:
+                # TODO: support N_rand != N_rand_small
+                assert N_rand == N_rand_small
+
+                # Random from one image
+                img_i = np.random.choice(i_train)
+                target = images[img_i]
+                pose = poses[img_i, :3,:4]
+
+                if N_rand is not None:
+                    rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+
+                    if i < args.precrop_iters:
+                        dH = int(H//2 * args.precrop_frac)
+                        dW = int(W//2 * args.precrop_frac)
+                        coords = torch.stack(
+                            torch.meshgrid(
+                                torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH),
+                                torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                            ), -1)
+                        if i == start:
+                            print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")
+                    else:
+                        coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+
+                    coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                    select_coords = coords[select_inds].long()  # (N_rand, 2)
+                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    batch_rays = torch.stack([rays_o, rays_d], 0)  # (2, N_rand, 3)
+                    target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+
+            #####  Core optimization loop  #####
+            rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
+
+            # optimizer.zero_grad()
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][...,-1]
+            loss = img_loss
+
+            psnr = mse2psnr(img_loss)
+
+            if 'rgb0' in extras:
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+                loss = loss + img_loss0
+                # psnr0 = mse2psnr(img_loss0)
+
+            weight = (rgb.size(0) / float(num_rays))
+            loss *= weight
+            total_weight += weight
+            loss.backward()
+
+        assert total_weight == 1.0
         optimizer.step()
 
         # NOTE: IMPORTANT!
@@ -807,52 +837,39 @@ def train():
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
-
-
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
+            print('', flush=True)
+            writer.add_scalar('loss', loss, global_step=global_step)
+            writer.add_scalar('psnr', psnr, global_step=global_step)
+            writer.add_scalar('lr', new_lrate, global_step=global_step)
+            writer.add_histogram('tran', trans, global_step=global_step)
+            # if args.N_importance > 0:
+            #     writer.add_scalar('psnr0', psnr0, global_step=global_step)
 
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+        if i % args.i_img == 0:
+            # Log a rendered validation view to Tensorboard
+            # img_i = np.random.choice(i_val)
+            img_i = i_val[0]
+            target = images[img_i]
+            pose = poses[img_i, :3, :4]
+            with torch.no_grad():
+                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                **render_kwargs_test)
 
+            psnr = mse2psnr(img2mse(rgb, target))
+            writer.add_image('rgb', rgb, dataformats='HWC', global_step=global_step)
+            writer.add_image('disp', torch.stack(3 * [disp], dim=-1), dataformats='HWC', global_step=global_step)
+            writer.add_image('acc', torch.stack(3 * [acc], dim=-1), dataformats='HWC', global_step=global_step)
+            writer.add_scalar('psnr_holdout', psnr, global_step=global_step)
+            writer.add_image('rgb_holdout', target, dataformats='HWC', global_step=global_step)
 
-            if i%args.i_img==0:
-
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
-
-                psnr = mse2psnr(img2mse(rgb, target))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
+            # if args.N_importance > 0:
+            #     with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+            #         tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
+            #         tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
+            #         tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
 
         global_step += 1
 

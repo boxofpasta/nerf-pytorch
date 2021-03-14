@@ -1,11 +1,12 @@
-expname = blender_paper_lego
-basedir = ./logs
+expname = momentum/mom-0.0_batch-2^10_multi
+basedir = /ais/gobi6/interpolation/depth/nerf
 datadir = ./data/nerf_synthetic/lego
 dataset_type = blender
 
 use_viewdirs = True
 white_bkgd = True
 lrate_decay = 500
+momentum = 0.0
 
 N_samples = 64
 N_importance = 128
