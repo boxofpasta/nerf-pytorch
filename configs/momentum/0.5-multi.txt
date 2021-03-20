@@ -1,4 +1,4 @@
-expname = momentum/mom-0.0_batch-2^10_multi
+expname = momentum/mom-0.5_batch-2^10_multi
 basedir = /ais/gobi6/interpolation/depth/nerf
 datadir = ./data/nerf_synthetic/lego
 dataset_type = blender
@@ -6,7 +6,7 @@ dataset_type = blender
 use_viewdirs = True
 white_bkgd = True
 lrate_decay = 500
-momentum = 0.0
+momentum = 0.5
 
 N_samples = 64
 N_importance = 128

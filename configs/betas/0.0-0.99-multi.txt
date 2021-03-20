@@ -1,0 +1,19 @@
+expname = betas/mom-0.0_b2-0.99_batch-2^10_multi
+basedir = /ais/gobi6/interpolation/depth/nerf
+datadir = ./data/nerf_synthetic/lego
+dataset_type = blender
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+momentum = 0.0
+rms_history = 0.99
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
